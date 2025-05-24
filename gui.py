@@ -1,19 +1,54 @@
-# llamaindex_rag_gui.py – Fully‑local RAG with vLLM + Gradio (rev‑2)
+# llamaindex_rag_gui.py – Fully‑local RAG with vLLM or Ollama + Gradio
 """
-Changes in this revision
------------------------
-* 📂 **Multi‑format queue** – supports .txt, .html, .md, .pdf, .docx plus URLs, gathered in a queue that the user can grow over multiple batches.
-* ⏩ **Explicit “Process queue” button** – ingestion runs only when the user clicks **Process queued docs**; index persists incrementally.
-* 🗄️ **State‑managed queue** – uses a `gr.State` list of `Document` objects so uploads and URLs are merged until processed.
-* 🔄 **Incremental indexing** – new nodes are inserted into the existing `VectorStoreIndex` without retracing previous docs.
-* 🏷️ **Rich metadata** – each chunk carries `file_path` or `source_url` plus page numbers or headings when available.
-* 🛡 **Improved readers & validation** – leverages LlamaIndex readers (`PDFReader`, `DocxReader`, `HTMLReader`, `MarkdownReader`) and graceful fallback for plain‑text.
-* 🖥️ **Cleaner UX** – drag‑and‑drop multi‑file upload, live queue counter, “Clear queue” helper, and chat token streaming.
+A Gradio-based GUI for a fully local Retrieval Augmented Generation (RAG) system.
+It supports document uploads (TXT, HTML, MD, PDF, DOCX) and URL ingestion,
+builds a local vector index, and allows users to chat with an LLM (either vLLM or Ollama)
+using the indexed documents as context.
 
-Requires  
+Features
+--------
+* 📂 **Multi‑format queue** – supports .txt, .html, .md, .pdf, .docx plus URLs.
+* ⏩ **Explicit “Process queue” button** – ingestion runs on demand.
+* 🗄️ **State‑managed queue** – uploads and URLs are queued until processed.
+* 🔄 **Incremental indexing** – new documents are added to the existing index.
+* 🏷️ **Rich metadata** – chunks include `file_path` or `source_url`.
+* 🛡 **Improved readers & validation** – uses LlamaIndex readers with fallbacks.
+* 🖥️ **Cleaner UX** – drag‑and‑drop uploads, queue counter, clear button, token streaming.
+* 🤖 **Flexible LLM Backend** – Supports vLLM (OpenAI-compatible server) or Ollama.
+
+Requires
+--------
+Install necessary Python packages:
 ```bash
-pip install gradio>=4 llama‑index‑core llama‑index‑readers‑file llama‑index‑readers‑web llama‑index‑llms‑vllm
+pip install gradio>=4 llama-index-core llama-index-readers-file llama-index-readers-web llama-index-llms-vllm llama-index-llms-ollama llama-index-embeddings-huggingface sentence-transformers
 ```
+
+Configuration
+-------------
+The script is configured via environment variables:
+
+*   `VLLM_API_URL`: URL for the vLLM OpenAI-compatible server endpoint.
+    *   Default: `http://localhost:8000/v1`
+    *   If this URL is set and contains `/v1`, the script will attempt to use vLLM.
+*   `OLLAMA_API_URL`: URL for the Ollama server endpoint.
+    *   Default: `http://localhost:11434`
+    *   Used if vLLM is not selected (i.e., `VLLM_API_URL` does not end in `/v1`).
+*   `LLM_MODEL_NAME`: The name of the language model to use.
+    *   Default: `mistralai/Mistral-7B-Instruct-v0.1`
+    *   **For vLLM:** This should be a HuggingFace model identifier that your vLLM server is configured to serve (e.g., "mistralai/Mistral-7B-Instruct-v0.1", "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO").
+    *   **For Ollama:** This should be an Ollama model name (e.g., "mistral", "llama3:8b-instruct-q5_K_M") or a full GGUF model ID if Ollama is configured to serve it directly by path/ID. Ensure the model is available in your Ollama instance (e.g., run `ollama pull <model_name>`).
+*   `EMBED_MODEL`: The HuggingFace model name for generating embeddings.
+    *   Default: `sentence-transformers/all-MiniLM-L6-v2`
+*   `CHUNK_SIZE`: Size of text chunks for parsing documents. Default: `512`.
+*   `CHUNK_OVERLAP`: Overlap between text chunks. Default: `64`.
+*   `MEMORY_TOKEN_LIMIT`: Token limit for chat memory. Default: `2048`.
+*   `TOP_K`: Number of top similar chunks to retrieve. Default: `4`.
+
+LLM Selection Logic
+-------------------
+The script prioritizes **vLLM** if the `VLLM_API_URL` environment variable is set and its value contains `/v1` (which is typical for OpenAI-compatible vLLM endpoints).
+Otherwise, it falls back to using **Ollama**, connecting to the server specified by `OLLAMA_API_URL`.
+Ensure that the chosen LLM server is running and accessible, and that `LLM_MODEL_NAME` is set appropriately for the selected backend.
 """
 
 import os
@@ -38,6 +73,7 @@ from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler
 
 # from llama_index.llms.openai import OpenAI
 from llama_index.llms.ollama import Ollama
+from llama_index.llms.vllm import VLLM # Added VLLM import
 from llama_index.core.llms import ChatMessage, MessageRole # Added for history conversion
 
 # ---------- CONFIG ---------- #
@@ -45,8 +81,15 @@ BASE_DIR = Path(__file__).parent
 DOCS_DIR = BASE_DIR / "docs"
 INDEX_DIR = BASE_DIR / "index"
 
-LLM_API_BASE = os.getenv("VLLM_API", "http://localhost:8000/v1")
-LLM_MODEL_NAME = os.getenv("LLM_MODEL", "hf.co/mradermacher/Qwen1.5-4B-Chat-i1-GGUF:Q6_K")
+# Environment variables for LLM configuration
+VLLM_API_URL = os.getenv("VLLM_API_URL", "http://localhost:8000/v1") # Standard vLLM endpoint
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434") # Standard Ollama endpoint
+
+# Default LLM_MODEL_NAME. This needs to be appropriate for the chosen LLM.
+# For VLLM: a HuggingFace model path (e.g., "mistralai/Mistral-7B-Instruct-v0.1")
+# For Ollama: a model name known to Ollama (e.g., "mistral", "qwen2:7b-instruct-q6_K")
+LLM_MODEL_NAME = os.getenv("LLM_MODEL", "mistralai/Mistral-7B-Instruct-v0.1") 
+
 EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 512))
@@ -58,20 +101,33 @@ DOCS_DIR.mkdir(exist_ok=True)
 INDEX_DIR.mkdir(exist_ok=True)
 
 # ---------- LLM & EMBEDDINGS ---------- #
-llm = Ollama(
-    model=LLM_MODEL_NAME,
-    api_base=LLM_API_BASE,
-    api_key="EMPTY",  # For vLLM or other OpenAI-compatible servers not requiring a key
-    context_window=32768, # Explicitly set context window for Mistral-7B-Instruct-v0.2
-    is_chat_model=True,
-    # temperature=0.1, # Optional: Add other LiteLLM parameters if needed
-    # max_tokens=512,   # Optional: Control output length
-)
+
+# Logic to decide which LLM to use
+# Prioritize vLLM if VLLM_API_URL seems like a vLLM OpenAI-compatible endpoint, otherwise Ollama.
+if "/v1" in VLLM_API_URL: 
+    llm = VLLM(
+        model=LLM_MODEL_NAME, # Should be HF model path, e.g., "mistralai/Mistral-7B-Instruct-v0.1"
+        api_url=VLLM_API_URL,
+        request_timeout=120.0,
+        # Ensure LLM_MODEL_NAME is set to a HF model path for VLLM in your environment
+    )
+    print(f"Using VLLM with model: {LLM_MODEL_NAME} at {VLLM_API_URL}")
+else:
+    llm = Ollama(
+        model=LLM_MODEL_NAME, # Should be an Ollama model name, e.g., "mistral" or a GGUF like "qwen2:7b-instruct-q6_K"
+        base_url=OLLAMA_API_URL, # Correct parameter for Ollama server
+        context_window=32768, 
+        is_chat_model=True,  
+        request_timeout=120.0
+        # Ensure LLM_MODEL_NAME is set to a model name Ollama can serve (e.g. run `ollama list`)
+    )
+    print(f"Using Ollama with model: {LLM_MODEL_NAME} at {OLLAMA_API_URL}")
+
 embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
 parser = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
 callback_manager = CallbackManager([LlamaDebugHandler()])
-Settings.llm = llm
+Settings.llm = llm # Settings.llm is now assigned within the if/else block
 Settings.embed_model = embed_model
 Settings.node_parser = parser
 Settings.callback_manager = callback_manager
@@ -106,10 +162,13 @@ url_reader = BeautifulSoupWebReader() # For URLs
 
 def _file_to_docs(tmp_upload_path: Path) -> List[Document]:
     """
-    Processes a single uploaded temporary file:
-    1. Copies it to the persistent DOCS_DIR.
-    2. Uses the appropriate LlamaIndex reader based on extension.
-    3. Returns a list of LlamaIndex Document objects with metadata.
+    Processes a single temporary file uploaded by the user via Gradio.
+    1. Copies the temporary file to a persistent local directory (`DOCS_DIR`).
+    2. Selects the appropriate LlamaIndex file reader based on the file extension.
+    3. Loads the file content into LlamaIndex `Document` objects.
+    4. Assigns `file_path` (and `page_label` for PDFs) metadata to each document.
+    5. Handles errors gracefully, providing user feedback via `gr.Error` or `gr.Warning`.
+    Returns a list of Document objects, or an empty list if processing fails.
     """
     docs: List[Document] = []
     # Use the name of the temporary file, which Gradio usually sets to the original filename
@@ -177,6 +236,31 @@ def _file_to_docs(tmp_upload_path: Path) -> List[Document]:
 
 doc_queue_state: List[Document] = [] # Holds Document objects ready for processing
 
+def _urls_to_docs(urls: List[str]) -> List[Document]:
+    all_docs: List[Document] = []
+    if not urls:
+        return all_docs
+
+    for url in urls:
+        try:
+            # BeautifulSoupWebReader().load_data() expects a list of URLs
+            # So, we process one URL at a time to isolate errors and correctly attribute metadata
+            # It returns a list of Document objects for each URL.
+            documents_from_url = url_reader.load_data(urls=[url]) # Pass as a list
+            
+            for doc in documents_from_url:
+                # Ensure metadata includes the source URL
+                doc.metadata.setdefault("source_url", url) 
+                # Add other relevant metadata if available/easy to extract
+            all_docs.extend(documents_from_url)
+            gr.Info(f"Successfully fetched and processed URL: {url}")
+        except Exception as e:
+            gr.Warning(f"⚠️ Failed to load URL '{url}': {e}")
+            # Optionally, create a placeholder document indicating failure, or just skip
+            # For now, just skipping and warning is fine.
+            
+    return all_docs
+
 # Helper function to convert Gradio chat history to LlamaIndex ChatMessage objects
 def convert_gradio_history_to_chatmessages(gradio_history: List[List[str]]) -> List[ChatMessage]:
     messages: List[ChatMessage] = []
@@ -212,9 +296,10 @@ def add_urls_to_queue(url_text: str, queue: List[Document]):
     urls = [u.strip() for u in url_text.splitlines() if u.strip()]
     if not urls:
         return queue, "⚠️ Enter at least one URL."
-    docs = _urls_to_docs(urls)
+    docs = _urls_to_docs(urls) # This is the call
     queue.extend(docs)
-    return queue, f"🔗 Queued {len(urls)} page(s). Total in queue: {len(queue)}"
+    # The f-string uses len(docs) which is the number of Document objects (chunks)
+    return queue, f"🔗 Queued {len(docs)} document chunk(s) from URLs. Total in queue: {len(queue)}"
 
 
 def clear_queue(_: bool, queue: List[Document]):
@@ -238,12 +323,18 @@ async def stream_answer(query: str, chat_history: List[List[str]]):
         return
 
     # Convert Gradio history and set it to the chat engine's memory
-    # This synchronizes the engine's memory with Gradio's displayed history.
+    # This synchronizes the engine's memory with Gradio's displayed history for each call.
+    # ChatMemoryBuffer.set() is a public method that replaces all messages in the buffer.
+    # Accessing chat_engine.memory (the ChatMemoryBuffer instance) and calling .set()
+    # is the appropriate way to manage history in a stateless-per-call Gradio setup.
     llm_chat_messages = convert_gradio_history_to_chatmessages(chat_history)
-    chat_engine._memory.set(llm_chat_messages) # Access the protected _memory attribute
+    chat_engine.memory.set(llm_chat_messages) 
 
-    # astream_chat will use the synchronized memory, add the new user query,
-    # process, and then update its memory with the new user query + AI response.
+    # astream_chat will use the history now set in chat_engine.memory,
+    # add the new user query, process, and then the memory buffer within the
+    # engine will be updated by LlamaIndex to include this latest turn.
+    # However, since Gradio sends the full history each time, we overwrite it above
+    # to ensure perfect sync with the UI's view of history.
     response_stream = await chat_engine.astream_chat(query)
     accumulated_response_content = ""
 
@@ -251,24 +342,16 @@ async def stream_answer(query: str, chat_history: List[List[str]]):
     async for delta in response_stream.async_response_gen(): # Corrected to use async_response_gen()
         # Ensure delta.content is not None before appending
         accumulated_response_content += (delta.content or "")
-        # Yield intermediate accumulated response for streaming effect
-        current_chat_entry = [query, accumulated_response_content]
-        # Update the last entry in chat_history or append if it's a new interaction
-        if chat_history and chat_history[-1][0] == query:
-            # This logic might be tricky if user sends same query twice;
-            # Gradio usually handles history by appending.
-            # For streaming, we update the *display* of the current turn.
-            # The final history update happens after the loop.
-            # For now, let's just yield the accumulated content for the current turn.
-            # Gradio's gr.Chatbot handles displaying this progressively.
-            yield "", chat_history[:-1] + [current_chat_entry] # Send updated history for display
-        else:
-            # This case might not be hit if Gradio handles history append before calling stream_answer
-            # or if we always append then update.
-            # Let's simplify: Gradio's Chatbot expects the full history + current streaming message.
-            # The input `chat_history` is the history *before* this turn.
-            yield "", chat_history + [[query, accumulated_response_content]]
-
+        
+        # Yielding strategy for Gradio:
+        # The function is a generator for a gr.Chatbot.
+        # It yields a tuple: (value_for_user_query_box, value_for_chatbot_display).
+        # Here, we send an empty string to clear the user_query_box,
+        # and the progressively updated chat_history to the chatbot.
+        # Gradio's Chatbot expects the full history list to be re-rendered on each yield.
+        # chat_history is the history *before* this current query.
+        # We append the current query and the so-far-accumulated response to it.
+        yield "", chat_history + [[query, accumulated_response_content]]
 
     # After stream is complete, finalize the message with sources
     final_bot_message = accumulated_response_content
@@ -292,9 +375,8 @@ async def stream_answer(query: str, chat_history: List[List[str]]):
 with gr.Blocks(title="Local RAG Assistant") as demo:
     gr.Markdown(
         """# 🤖 Local RAG Assistant  
-Upload **TXT / HTML / Markdown / PDF / DOCX** or paste URLs.  
-Add as many as you like, then click **Process queued docs** to build your private knowledge base.  
-All ranking & generation run **entirely on your machine** using vLLM + LlamaIndex.
+Supports **vLLM or Ollama** for local LLM inference. Configure using environment variables (see script docstring or console output for details on which LLM is active).  
+Upload documents (TXT, PDF, DOCX, HTML, MD) or URLs, then click **Process queued docs** to build your private knowledge base.
 """
     )
 
