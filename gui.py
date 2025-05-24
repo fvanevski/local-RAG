@@ -20,7 +20,7 @@ Requires
 --------
 Install necessary Python packages:
 ```bash
-pip install gradio>=4 llama-index-core llama-index-readers-file llama-index-readers-web llama-index-llms-vllm llama-index-llms-ollama llama-index-embeddings-huggingface sentence-transformers
+pip install gradio>=4 llama-index-core llama-index-readers-file llama-index-readers-web llama-index-llms-vllm llama-index-llms-ollama llama-index-embeddings-huggingface sentence-transformers optimum[onnxruntime-gpu]
 ```
 
 Usage
@@ -50,8 +50,11 @@ The script is configured primarily via environment variables. Default values are
     *   Default: `mistralai/Mistral-7B-Instruct-v0.1`
     *   **For vLLM:** This should be a HuggingFace model identifier that your vLLM server is configured to serve (e.g., "mistralai/Mistral-7B-Instruct-v0.1").
     *   **For Ollama:** This should be an Ollama model name (e.g., "mistral", "llama3:8b-instruct-q5_K_M"). Ensure the model is available in your Ollama instance.
-*   `EMBED_MODEL`: The HuggingFace model name for generating embeddings.
-    *   Default: `sentence-transformers/all-MiniLM-L6-v2`
+*   `EMBED_MODEL`: Specifies the HuggingFace Sentence Transformers model to use for local embeddings.
+    *   Default: `"BAAI/bge-small-en-v1.5"`
+    *   The script uses this model with the ONNX backend (`backend="onnx"`) for potentially accelerated inference.
+    *   If an ONNX version of the model is not found locally or on the Hugging Face Hub, it may be automatically 
+      converted by Optimum on first use, which can introduce a one-time delay.
 *   `CHUNK_SIZE`: Size of text chunks for parsing documents.
     *   Default: `512`
 *   `CHUNK_OVERLAP`: Overlap between text chunks.
@@ -62,6 +65,21 @@ The script is configured primarily via environment variables. Default values are
     *   Default: `4`
 
 Ensure that the chosen LLM server (vLLM or Ollama) is running and accessible at the specified URL, and that the `LLM_MODEL_NAME` is appropriate for that backend.
+
+Testing Considerations for ONNX Embeddings
+------------------------------------------
+- **GPU Setup for ONNX Runtime:** To leverage GPU acceleration with `optimum[onnxruntime-gpu]`,
+  ensure you have a compatible NVIDIA GPU, current NVIDIA drivers, and the correct CUDA toolkit
+  version installed that aligns with the `onnxruntime-gpu` package requirements.
+- **First-Run Model Conversion:** When using a new embedding model with the ONNX backend for the
+  first time, Optimum may automatically convert the model to the ONNX format if one is not
+  readily available. This one-time process can cause a significant delay. Subsequent uses of
+  the same model should load faster from the cached ONNX version.
+- **Verify GPU Usage:** You can monitor your GPU's activity (e.g., using `nvidia-smi` on Linux/Windows)
+  during document processing to confirm that the embedding computations are running on the GPU.
+- **CPU Fallback/Errors:** If GPU prerequisites are not met, `onnxruntime-gpu` might fall back to
+  CPU-based inference (which will be slower) or could error out. Refer to ONNX Runtime and
+  Optimum documentation for detailed troubleshooting.
 """
 
 import os
@@ -100,7 +118,7 @@ INDEX_DIR = BASE_DIR / "index"
 VLLM_API_URL_DEFAULT = "http://localhost:8000/v1"
 OLLAMA_API_URL_DEFAULT = "http://localhost:11434"
 LLM_MODEL_NAME_DEFAULT = "mistralai/Mistral-7B-Instruct-v0.1" # Suitable for vLLM by default
-EMBED_MODEL_DEFAULT = "sentence-transformers/all-MiniLM-L6-v2"
+EMBED_MODEL_DEFAULT = "BAAI/bge-small-en-v1.5" # Updated default for ONNX
 CHUNK_SIZE_DEFAULT = 512
 CHUNK_OVERLAP_DEFAULT = 64
 MEMORY_TOKEN_LIMIT_DEFAULT = 2048
@@ -166,8 +184,14 @@ def _setup_llm_and_settings(cli_args):
     # Configure LlamaIndex Settings
     Settings.llm = llm
     
-    embed_model_name = os.getenv("EMBED_MODEL", EMBED_MODEL_DEFAULT)
-    Settings.embed_model = HuggingFaceEmbedding(model_name=embed_model_name)
+    embed_model_name_env = os.getenv("EMBED_MODEL", EMBED_MODEL_DEFAULT)
+    # Using HuggingFaceEmbedding with ONNX backend
+    effective_embed_model = HuggingFaceEmbedding(
+        model_name=embed_model_name_env, 
+        backend="onnx"
+    )
+    Settings.embed_model = effective_embed_model 
+    print(f"Using local embedding model: {embed_model_name_env} with ONNX backend.")
     
     chunk_size = int(os.getenv("CHUNK_SIZE", CHUNK_SIZE_DEFAULT))
     chunk_overlap = int(os.getenv("CHUNK_OVERLAP", CHUNK_OVERLAP_DEFAULT))
