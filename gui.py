@@ -23,35 +23,50 @@ Install necessary Python packages:
 pip install gradio>=4 llama-index-core llama-index-readers-file llama-index-readers-web llama-index-llms-vllm llama-index-llms-ollama llama-index-embeddings-huggingface sentence-transformers
 ```
 
+Usage
+-----
+Run the script from the command line, specifying the LLM backend:
+```bash
+python gui.py --llm-backend <backend_choice>
+```
+Where `<backend_choice>` is either `vllm` or `ollama`. This argument is required.
+
+Examples:
+*   To use a vLLM server: `python gui.py --llm-backend vllm`
+*   To use an Ollama server: `python gui.py --llm-backend ollama`
+
 Configuration
 -------------
-The script is configured via environment variables:
+The script is configured primarily via environment variables. Default values are used if an environment variable is not set, but some are required based on the chosen LLM backend.
 
-*   `VLLM_API_URL`: URL for the vLLM OpenAI-compatible server endpoint.
-    *   Default: `http://localhost:8000/v1`
-    *   If this URL is set and contains `/v1`, the script will attempt to use vLLM.
-*   `OLLAMA_API_URL`: URL for the Ollama server endpoint.
-    *   Default: `http://localhost:11434`
-    *   Used if vLLM is not selected (i.e., `VLLM_API_URL` does not end in `/v1`).
-*   `LLM_MODEL_NAME`: The name of the language model to use.
+**Required Environment Variables (based on `--llm-backend` choice):**
+*   If `--llm-backend vllm` is chosen:
+    *   `VLLM_API_URL`: Must be set to the URL of your vLLM OpenAI-compatible server endpoint (e.g., `http://localhost:8000/v1`). There is no default if this backend is chosen; the variable must be present.
+*   If `--llm-backend ollama` is chosen:
+    *   `OLLAMA_API_URL`: Must be set to the URL of your Ollama server endpoint (e.g., `http://localhost:11434`). There is no default if this backend is chosen; the variable must be present.
+
+**Optional Environment Variables (defaults are provided):**
+*   `LLM_MODEL_NAME`: The name/identifier of the language model.
     *   Default: `mistralai/Mistral-7B-Instruct-v0.1`
-    *   **For vLLM:** This should be a HuggingFace model identifier that your vLLM server is configured to serve (e.g., "mistralai/Mistral-7B-Instruct-v0.1", "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO").
-    *   **For Ollama:** This should be an Ollama model name (e.g., "mistral", "llama3:8b-instruct-q5_K_M") or a full GGUF model ID if Ollama is configured to serve it directly by path/ID. Ensure the model is available in your Ollama instance (e.g., run `ollama pull <model_name>`).
+    *   **For vLLM:** This should be a HuggingFace model identifier that your vLLM server is configured to serve (e.g., "mistralai/Mistral-7B-Instruct-v0.1").
+    *   **For Ollama:** This should be an Ollama model name (e.g., "mistral", "llama3:8b-instruct-q5_K_M"). Ensure the model is available in your Ollama instance.
 *   `EMBED_MODEL`: The HuggingFace model name for generating embeddings.
     *   Default: `sentence-transformers/all-MiniLM-L6-v2`
-*   `CHUNK_SIZE`: Size of text chunks for parsing documents. Default: `512`.
-*   `CHUNK_OVERLAP`: Overlap between text chunks. Default: `64`.
-*   `MEMORY_TOKEN_LIMIT`: Token limit for chat memory. Default: `2048`.
-*   `TOP_K`: Number of top similar chunks to retrieve. Default: `4`.
+*   `CHUNK_SIZE`: Size of text chunks for parsing documents.
+    *   Default: `512`
+*   `CHUNK_OVERLAP`: Overlap between text chunks.
+    *   Default: `64`
+*   `MEMORY_TOKEN_LIMIT`: Token limit for chat memory. Also used as `context_window` for Ollama.
+    *   Default: `2048`
+*   `TOP_K`: Number of top similar chunks to retrieve for RAG.
+    *   Default: `4`
 
-LLM Selection Logic
--------------------
-The script prioritizes **vLLM** if the `VLLM_API_URL` environment variable is set and its value contains `/v1` (which is typical for OpenAI-compatible vLLM endpoints).
-Otherwise, it falls back to using **Ollama**, connecting to the server specified by `OLLAMA_API_URL`.
-Ensure that the chosen LLM server is running and accessible, and that `LLM_MODEL_NAME` is set appropriately for the selected backend.
+Ensure that the chosen LLM server (vLLM or Ollama) is running and accessible at the specified URL, and that the `LLM_MODEL_NAME` is appropriate for that backend.
 """
 
 import os
+import argparse # Added for CLI argument parsing
+import sys # Added for sys.exit
 from pathlib import Path
 from typing import List, Tuple
 import shutil # Added for file copying
@@ -81,56 +96,90 @@ BASE_DIR = Path(__file__).parent
 DOCS_DIR = BASE_DIR / "docs"
 INDEX_DIR = BASE_DIR / "index"
 
-# Environment variables for LLM configuration
-VLLM_API_URL = os.getenv("VLLM_API_URL", "http://localhost:8000/v1") # Standard vLLM endpoint
-OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434") # Standard Ollama endpoint
+# Environment variable DEFAULTS
+VLLM_API_URL_DEFAULT = "http://localhost:8000/v1"
+OLLAMA_API_URL_DEFAULT = "http://localhost:11434"
+LLM_MODEL_NAME_DEFAULT = "mistralai/Mistral-7B-Instruct-v0.1" # Suitable for vLLM by default
+EMBED_MODEL_DEFAULT = "sentence-transformers/all-MiniLM-L6-v2"
+CHUNK_SIZE_DEFAULT = 512
+CHUNK_OVERLAP_DEFAULT = 64
+MEMORY_TOKEN_LIMIT_DEFAULT = 2048
+TOP_K_DEFAULT = 4
 
-# Default LLM_MODEL_NAME. This needs to be appropriate for the chosen LLM.
-# For VLLM: a HuggingFace model path (e.g., "mistralai/Mistral-7B-Instruct-v0.1")
-# For Ollama: a model name known to Ollama (e.g., "mistral", "qwen2:7b-instruct-q6_K")
-LLM_MODEL_NAME = os.getenv("LLM_MODEL", "mistralai/Mistral-7B-Instruct-v0.1") 
+# Global variable to store command-line arguments
+ARGS = None
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+# These will be configured in _setup_llm_and_settings
+# Settings.llm, Settings.embed_model, Settings.node_parser, Settings.callback_manager
 
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 512))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 64))
-MEMORY_TOKEN_LIMIT = int(os.getenv("MEMORY_LIMIT", 2048))
-TOP_K = int(os.getenv("TOP_K", 4))
-
-DOCS_DIR.mkdir(exist_ok=True)
-INDEX_DIR.mkdir(exist_ok=True)
-
-# ---------- LLM & EMBEDDINGS ---------- #
-
-# Logic to decide which LLM to use
-# Prioritize vLLM if VLLM_API_URL seems like a vLLM OpenAI-compatible endpoint, otherwise Ollama.
-if "/v1" in VLLM_API_URL: 
-    llm = VLLM(
-        model=LLM_MODEL_NAME, # Should be HF model path, e.g., "mistralai/Mistral-7B-Instruct-v0.1"
-        api_url=VLLM_API_URL,
-        request_timeout=120.0,
-        # Ensure LLM_MODEL_NAME is set to a HF model path for VLLM in your environment
+def _parse_cli_args():
+    """Parses command-line arguments for LLM backend selection."""
+    parser = argparse.ArgumentParser(description="Local RAG Assistant with selectable LLM backend.")
+    parser.add_argument(
+        "--llm-backend",
+        choices=["vllm", "ollama"],
+        required=True,
+        help="Choose the LLM backend: 'vllm' for a vLLM OpenAI-compatible server, or 'ollama' for an Ollama server."
     )
-    print(f"Using VLLM with model: {LLM_MODEL_NAME} at {VLLM_API_URL}")
-else:
-    llm = Ollama(
-        model=LLM_MODEL_NAME, # Should be an Ollama model name, e.g., "mistral" or a GGUF like "qwen2:7b-instruct-q6_K"
-        base_url=OLLAMA_API_URL, # Correct parameter for Ollama server
-        context_window=32768, 
-        is_chat_model=True,  
-        request_timeout=120.0
-        # Ensure LLM_MODEL_NAME is set to a model name Ollama can serve (e.g. run `ollama list`)
-    )
-    print(f"Using Ollama with model: {LLM_MODEL_NAME} at {OLLAMA_API_URL}")
+    return parser.parse_args()
 
-embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
-parser = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+def _setup_llm_and_settings(cli_args):
+    """Initializes LLM and LlamaIndex settings based on CLI arguments and environment variables."""
+    llm = None # Initialize llm to None
+    backend_choice = cli_args.llm_backend
 
-callback_manager = CallbackManager([LlamaDebugHandler()])
-Settings.llm = llm # Settings.llm is now assigned within the if/else block
-Settings.embed_model = embed_model
-Settings.node_parser = parser
-Settings.callback_manager = callback_manager
+    # Retrieve model name and API URLs from environment variables, using defaults if not set.
+    # The actual check for presence of API URL for the *selected* backend happens below.
+    llm_model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME_DEFAULT)
+    
+    if backend_choice == "vllm":
+        vllm_api_url = os.getenv("VLLM_API_URL") # Check actual presence
+        if not vllm_api_url:
+            print("Error: --llm-backend set to 'vllm', but VLLM_API_URL environment variable is not set.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Using VLLM backend. Model: {llm_model_name}, API URL: {vllm_api_url}")
+        print(f"Ensure LLM_MODEL_NAME ('{llm_model_name}') is a HuggingFace model path compatible with your vLLM server.")
+        llm = VLLM(
+            model=llm_model_name,
+            api_url=vllm_api_url,
+            request_timeout=120.0
+        )
+    elif backend_choice == "ollama":
+        ollama_api_url = os.getenv("OLLAMA_API_URL") # Check actual presence
+        if not ollama_api_url:
+            print("Error: --llm-backend set to 'ollama', but OLLAMA_API_URL environment variable is not set.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Using Ollama backend. Model: {llm_model_name}, API URL: {ollama_api_url}")
+        print(f"Ensure LLM_MODEL_NAME ('{llm_model_name}') is an Ollama model name (e.g., 'mistral', 'llama2:13b').")
+        llm = Ollama(
+            model=llm_model_name,
+            base_url=ollama_api_url,
+            context_window=int(os.getenv("MEMORY_TOKEN_LIMIT", MEMORY_TOKEN_LIMIT_DEFAULT)), # Ollama uses context_window
+            is_chat_model=True, # Assuming chat model usage
+            request_timeout=120.0
+        )
+    else:
+        # This case should be caught by argparse `choices`
+        print(f"Error: Invalid --llm-backend choice: {backend_choice}", file=sys.stderr)
+        sys.exit(1)
+
+    # Configure LlamaIndex Settings
+    Settings.llm = llm
+    
+    embed_model_name = os.getenv("EMBED_MODEL", EMBED_MODEL_DEFAULT)
+    Settings.embed_model = HuggingFaceEmbedding(model_name=embed_model_name)
+    
+    chunk_size = int(os.getenv("CHUNK_SIZE", CHUNK_SIZE_DEFAULT))
+    chunk_overlap = int(os.getenv("CHUNK_OVERLAP", CHUNK_OVERLAP_DEFAULT))
+    Settings.node_parser = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    
+    Settings.callback_manager = CallbackManager([LlamaDebugHandler()])
+    
+    # Create DOCS_DIR and INDEX_DIR if they don't exist
+    # Moved here to ensure they are created after initial CLI parsing and basic setup
+    DOCS_DIR.mkdir(exist_ok=True)
+    INDEX_DIR.mkdir(exist_ok=True)
+
 
 # ---------- INDEX UTIL ---------- #
 
@@ -375,7 +424,10 @@ async def stream_answer(query: str, chat_history: List[List[str]]):
 with gr.Blocks(title="Local RAG Assistant") as demo:
     gr.Markdown(
         """# 🤖 Local RAG Assistant  
-Supports **vLLM or Ollama** for local LLM inference. Configure using environment variables (see script docstring or console output for details on which LLM is active).  
+**Important:** Start this script using a command-line flag to select your LLM backend:  
+`python gui.py --llm-backend vllm` or `python gui.py --llm-backend ollama`  
+Ensure `VLLM_API_URL` (for vLLM) or `OLLAMA_API_URL` (for Ollama) is set in your environment.  
+
 Upload documents (TXT, PDF, DOCX, HTML, MD) or URLs, then click **Process queued docs** to build your private knowledge base.
 """
     )
@@ -414,4 +466,22 @@ Upload documents (TXT, PDF, DOCX, HTML, MD) or URLs, then click **Process queued
     send_btn.click(stream_answer, inputs=[user_query, chatbot], outputs=[user_query, chatbot])
 
 if __name__ == "__main__":
+    ARGS = _parse_cli_args()
+    
+    # Setup LLM and other LlamaIndex settings based on CLI args
+    _setup_llm_and_settings(ARGS) 
+    
+    # Initialize index and chat_engine after settings are configured
+    # These were global before, ensure they are initialized after setup
+    index = load_or_create_index()
+    chat_memory = ChatMemoryBuffer.from_defaults(
+        token_limit=int(os.getenv("MEMORY_TOKEN_LIMIT", MEMORY_TOKEN_LIMIT_DEFAULT))
+    )
+    chat_engine = index.as_chat_engine(
+        chat_mode="context",
+        memory=chat_memory,
+        similarity_top_k=int(os.getenv("TOP_K", TOP_K_DEFAULT)),
+        system_prompt="" 
+    )
+    
     demo.launch()
