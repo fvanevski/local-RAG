@@ -88,7 +88,7 @@ from llama_index.core.callbacks import CallbackManager, LlamaDebugHandler
 
 # from llama_index.llms.openai import OpenAI
 from llama_index.llms.ollama import Ollama
-from llama_index.llms.vllm import VLLM # Added VLLM import
+from llama_index.llms.vllm import Vllm # Added VLLM import
 from llama_index.core.llms import ChatMessage, MessageRole # Added for history conversion
 
 # ---------- CONFIG ---------- #
@@ -99,7 +99,7 @@ INDEX_DIR = BASE_DIR / "index"
 # Environment variable DEFAULTS
 VLLM_API_URL_DEFAULT = "http://localhost:8000/v1"
 OLLAMA_API_URL_DEFAULT = "http://localhost:11434"
-LLM_MODEL_NAME_DEFAULT = "mistralai/Mistral-7B-Instruct-v0.1" # Suitable for vLLM by default
+LLM_MODEL_NAME_DEFAULT = "mradermacher/Qwen1.5-4B-Chat-i1-GGUF:Q6_K" # Suitable for vLLM by default
 EMBED_MODEL_DEFAULT = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_SIZE_DEFAULT = 512
 CHUNK_OVERLAP_DEFAULT = 64
